@@ -167,14 +167,12 @@ function bigIntToHex(n) {
 
 // ============= EVM Transaction =============
 
-async function buildEvmTransaction({ to, amount, token, privateKey, chain, max = false }) {
+// `sign(unsignedTx)` receives 0x02 || RLP(payload) and resolves to
+// { r, s, v: recoveryBit }. Without it (dry run) nothing is signed.
+async function buildEvmTransaction({ to, amount, token, from, sign, chain, max = false }) {
   const chainId = CHAIN_IDS[chain];
   if (!chainId) throw new Error(`Unsupported chain: ${chain} (no chain ID configured for EVM transfers)`);
   const rpcUrl = CHAIN_RPCS[chain] || CHAIN_RPCS.evm;
-
-  // Derive address and buffer for signing
-  const privBuf = Buffer.from(privateKey, 'hex');
-  const from = deriveEvmAddress(privateKey);
 
   // Fetch both pending and latest nonce counts. 'pending' is used so mempool-
   // queued transactions are counted — 'latest' alone would assign the same
@@ -305,9 +303,10 @@ async function buildEvmTransaction({ to, amount, token, privateKey, chain, max =
     [], // accessList
   ];
 
+  if (!sign) return { amount: txValue };
+
   const unsigned = rlpEncode(txFields);
-  const txHash = keccak256(Buffer.concat([Buffer.from([0x02]), unsigned]));
-  const sig = signSecp256k1(txHash, privBuf);
+  const sig = await sign(Buffer.concat([Buffer.from([0x02]), unsigned]));
 
   const signed = rlpEncode([
     ...txFields,
@@ -549,28 +548,72 @@ export async function buildUnsignedSolanaTransaction({ to, amount, amountStr, to
   return { unsignedTransaction: txBytes.toString('base64') };
 }
 
-async function buildSolanaTransaction({ to, amount, amountStr, token, privateKey }) {
-  const keypairBuf = Buffer.from(privateKey, 'hex');
-  const seed = keypairBuf.subarray(0, 32);
-  const fromPubkey = keypairBuf.subarray(32, 64);
-  const fromAddress = base58Encode(fromPubkey);
-
+// `sign(txBytes)` receives the full wire transaction (empty signature slot)
+// and resolves to the 64-byte Ed25519 signature. Without it (dry run) nothing
+// is signed.
+async function buildSolanaTransaction({ to, amount, amountStr, token, from, sign }) {
   const { unsignedTransaction } = await buildUnsignedSolanaTransaction({
-    to, amount, amountStr, token, fromAddress,
+    to, amount, amountStr, token, fromAddress: from,
   });
+  if (!sign) return {};
 
-  // Sign: extract message bytes, sign, insert signature
+  // Sign, then insert the signature into the fee payer's slot
   const txBytes = Buffer.from(unsignedTransaction, 'base64');
-  const sigCountSize = 1; // compact-u16 for count=1 is always 1 byte
-  const messageBytes = txBytes.subarray(sigCountSize + 64);
-  const signature = signEd25519(messageBytes, seed);
+  const signature = await sign(txBytes);
   const signedTx = Buffer.from(txBytes);
-  signature.copy(signedTx, sigCountSize);
+  signature.copy(signedTx, SOLANA_SIG_COUNT_SIZE);
 
   return { signedTransaction: signedTx.toString('base64') };
 }
 
-// ============= Broadcasting =============
+// ============= Signers =============
+
+const SOLANA_SIG_COUNT_SIZE = 1; // compact-u16 for count=1 is always 1 byte
+
+// The account a send is built for: `address` is the one reported back to the
+// user, `from` the one the builder queries the RPC with, and `sign` the only
+// step that differs between a local key and a Ledger.
+function localAccount(walletData, chain) {
+  if (chain === 'solana') {
+    const keypairBuf = Buffer.from(walletData.solana.privateKey, 'hex');
+    const seed = keypairBuf.subarray(0, 32);
+    return {
+      address: walletData.solana.address,
+      from: base58Encode(keypairBuf.subarray(32, 64)),
+      sign: async (txBytes) => signEd25519(txBytes.subarray(SOLANA_SIG_COUNT_SIZE + 64), seed),
+    };
+  }
+  const privBuf = Buffer.from(walletData.evm.privateKey, 'hex');
+  return {
+    address: walletData.evm.address,
+    from: deriveEvmAddress(walletData.evm.privateKey),
+    sign: async (unsignedTx) => signSecp256k1(keccak256(unsignedTx), privBuf),
+  };
+}
+
+// The USB session is opened only once the transaction is built, so a dry run
+// never needs the device.
+function ledgerAccount(walletInfo, chain) {
+  const signWithLedger = async (method, expected, tx) => {
+    const { withLedger } = await import('./ledger.js');
+    return withLedger((session) => session[method](expected, tx));
+  };
+  if (chain === 'solana') {
+    const expected = { address: walletInfo.solana, path: walletInfo.ledgerPaths?.solana };
+    return {
+      address: walletInfo.solana,
+      from: walletInfo.solana,
+      sign: (txBytes) => signWithLedger('signSolanaTransaction', expected, txBytes),
+    };
+  }
+  const expected = { address: walletInfo.evm, path: walletInfo.ledgerPaths?.evm };
+  return {
+    address: walletInfo.evm,
+    // Lowercase like deriveEvmAddress, so RPC params match the local path
+    from: walletInfo.evm.toLowerCase(),
+    sign: (unsignedTx) => signWithLedger('signEvmTransaction', expected, unsignedTx),
+  };
+}
 
 // ============= Confirmation =============
 
@@ -791,15 +834,21 @@ export async function sendTokens({ to, amount, chain, token = null, wallet = nul
     return sendTokensViaPrivy({ to, amount, chain, token, max, dryRun, walletInfo });
   }
 
-  if (config.passwordHash && !verifyPassword(password, config)) throw new Error('Incorrect password');
-  const walletData = exportWallet(walletName, password);
+  let account;
+  if (walletInfo.provider === 'ledger') {
+    account = ledgerAccount(walletInfo, chain);
+  } else {
+    if (config.passwordHash && !verifyPassword(password, config)) throw new Error('Incorrect password');
+    account = localAccount(exportWallet(walletName, password), chain);
+  }
+  const sign = dryRun ? null : account.sign;
 
   let result;
   if (chain === 'solana') {
     if (max && !token) {
       // Max native SOL: balance - 5000 lamports fee
       const rpcUrl = CHAIN_RPCS.solana;
-      const fromAddr = walletData.solana.address;
+      const fromAddr = account.address;
       const balResult = await rpcCall(rpcUrl, 'getBalance', [fromAddr, { commitment: 'confirmed' }]);
       const solBalance = BigInt(balResult.value);
       const fee = 5000n;
@@ -811,7 +860,7 @@ export async function sendTokens({ to, amount, chain, token = null, wallet = nul
       // Max SPL: full token balance
       const rpcUrl = CHAIN_RPCS.solana;
       const { tokenProgram, decimals: _decimals } = await getTokenInfo(rpcUrl, token);
-      const sourceATA = deriveATA(walletData.solana.address, token, tokenProgram);
+      const sourceATA = deriveATA(account.address, token, tokenProgram);
       const sourceAtaAddr = base58Encode(sourceATA);
       const ataInfo = await rpcCall(rpcUrl, 'getTokenAccountBalance', [sourceAtaAddr]);
       amount = ataInfo.value.uiAmountString;
@@ -820,7 +869,7 @@ export async function sendTokens({ to, amount, chain, token = null, wallet = nul
     const amountRaw = token ? null : parseAmount(amount, 9);
     result = await buildSolanaTransaction({
       to, amount: amountRaw, amountStr: amount, token,
-      privateKey: walletData.solana.privateKey,
+      from: account.from, sign,
     });
   } else {
     const rpcUrl = CHAIN_RPCS[chain] || CHAIN_RPCS.evm;
@@ -833,9 +882,8 @@ export async function sendTokens({ to, amount, chain, token = null, wallet = nul
 
     if (max && token) {
       // Max ERC-20: full token balance
-      const from = deriveEvmAddress(walletData.evm.privateKey);
       const balResult = await rpcCall(rpcUrl, 'eth_call', [{
-        to: token, data: '0x70a08231' + from.slice(2).padStart(64, '0'),
+        to: token, data: '0x70a08231' + account.from.slice(2).padStart(64, '0'),
       }, 'latest']);
       const tokenBalance = BigInt(balResult || '0x0');
       if (tokenBalance === 0n) throw new Error('Token balance is zero');
@@ -846,7 +894,7 @@ export async function sendTokens({ to, amount, chain, token = null, wallet = nul
     const amountRaw = (max && !token) ? 0n : parseAmount(amount, decimals);
     result = await buildEvmTransaction({
       to, amount: amountRaw, token,
-      privateKey: walletData.evm.privateKey,
+      from: account.from, sign,
       chain, max: max && !token,
     });
   }
@@ -858,7 +906,7 @@ export async function sendTokens({ to, amount, chain, token = null, wallet = nul
       : amount;
     return {
       dryRun: true,
-      from: chain === 'solana' ? walletData.solana.address : walletData.evm.address,
+      from: account.address,
       to, amount: finalAmount, token, chain,
       ...(result.estimatedFee ? { estimatedFee: result.estimatedFee } : {}),
     };
@@ -885,7 +933,7 @@ export async function sendTokens({ to, amount, chain, token = null, wallet = nul
     transactionHash: txHash,
     confirmed: confirmation.confirmed,
     ...(confirmation.blockNumber ? { blockNumber: confirmation.blockNumber } : {}),
-    from: chain === 'solana' ? walletData.solana.address : walletData.evm.address,
+    from: account.address,
     to, amount: finalAmount, token, chain,
     explorer: getExplorerUrl(chain, txHash),
   };

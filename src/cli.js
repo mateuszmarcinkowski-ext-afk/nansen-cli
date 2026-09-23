@@ -1217,8 +1217,8 @@ EXAMPLES:
   nansen trade limit-order list
 
 WALLET:
-  --wallet <name>   Use a named wallet, or "walletconnect" / "wc" for WalletConnect.
-                    Defaults to the default local wallet if omitted.
+  --wallet <name>   Use a named wallet (local, Privy or Ledger), or "walletconnect" /
+                    "wc" for WalletConnect. Defaults to the default wallet if omitted.
 
 BEFORE BROADCASTING (execute only):
   --dry-run         Validate and print what would be sent, then stop. Nothing is

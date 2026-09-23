@@ -24,6 +24,7 @@ import {
 } from './hl-action.js';
 import { submitExchange } from './hl-client.js';
 import { hlApiUrl, hlNetwork } from './hl-env.js';
+import { ledgerUnsupportedError } from './ledger.js';
 import { trackPerpOrderCompleted } from './telemetry.js';
 import { resolveEvmWallet, resolvePrivateKey } from './wallet-signing.js';
 import { hashTypedData } from './x402-evm.js';
@@ -613,6 +614,7 @@ function warnImpreciseValue(coin, szDecimals, { sizeRaw, priceRaw }, warn) {
 // resolve the key afterwards, matching the previous ordering. Takes the resolved
 // wallet, not its name, so the wallet is read once per command.
 async function resolveSigningCtx(wallet, log) {
+  if (wallet.provider === 'ledger') throw ledgerUnsupportedError('Hyperliquid perp trading');
   const ctx = {
     walletAddress: wallet.address,
     privateKeyHex: null,

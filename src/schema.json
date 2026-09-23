@@ -2076,7 +2076,7 @@
             },
             "wallet": {
               "type": "string",
-              "description": "Wallet name (or \"walletconnect\"/\"wc\" for WalletConnect, EVM only). A configured wallet is required — run `nansen wallet create` if you haven't set one up yet."
+              "description": "Wallet name (local, Privy or Ledger), or \"walletconnect\"/\"wc\" for WalletConnect (EVM only). A configured wallet is required — run `nansen wallet create` if you haven't set one up yet."
             },
             "to-wallet": {
               "type": "string",
@@ -2132,7 +2132,7 @@
             },
             "wallet": {
               "type": "string",
-              "description": "Wallet name, or \"walletconnect\"/\"wc\" for WalletConnect (EVM only)"
+              "description": "Wallet name (local, Privy or Ledger), or \"walletconnect\"/\"wc\" for WalletConnect (EVM only)"
             },
             "gasless": {
               "type": "boolean",
@@ -2344,6 +2344,12 @@
         "create": {
           "description": "Create a new wallet. Explicitly blank --name values are rejected for local and Privy wallets.",
           "options": {
+            "provider": {
+              "type": "string",
+              "enum": ["local", "privy", "ledger"],
+              "default": "local",
+              "description": "Wallet provider: local (encrypted keys on disk), privy (server-side Privy wallets) or ledger (Ledger over USB; keys stay on the device, needs the optional @ledgerhq peer packages). Env: NANSEN_WALLET_PROVIDER"
+            },
             "unsafe-no-password": {
               "type": "boolean",
               "description": "Skip encryption; private keys are stored unencrypted on disk (local only)"
@@ -2351,7 +2357,8 @@
           },
           "examples": [
             "nansen wallet create --name trading",
-            "nansen wallet create --name agent-wallet --provider privy"
+            "nansen wallet create --name agent-wallet --provider privy",
+            "nansen wallet create --name cold --provider ledger"
           ]
         },
         "list": {

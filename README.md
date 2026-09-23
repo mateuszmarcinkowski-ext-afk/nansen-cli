@@ -73,7 +73,7 @@ Plus the `historical-*` point-in-time commands — run `nansen research help` fo
 
 **Trade:** `quote`, `execute`, `bridge-status`, `limit-order` — DEX swaps on Solana and Base, cross-chain bridges, and Solana limit orders.
 
-**Wallet:** `create`, `list`, `show`, `export`, `default`, `delete`, `send`, `forget-password`, `secure` — local or Privy server-side wallets (EVM + Solana).
+**Wallet:** `create`, `list`, `show`, `export`, `default`, `delete`, `send`, `forget-password`, `secure` — local, Privy server-side, or Ledger hardware wallets (EVM + Solana).
 
 Run `nansen schema --pretty` for the full subcommand and field reference.
 
@@ -244,6 +244,7 @@ Supported routes: `base → hyperliquid` (deposit), and `hyperliquid → base`/`
 ```bash
 nansen wallet create --name my-wallet        # local keypair (EVM + Solana)
 nansen wallet create --name my-wallet --provider privy  # server-side via Privy
+nansen wallet create --name cold --provider ledger      # Ledger over USB
 nansen wallet list
 nansen wallet default <name>
 nansen wallet send --wallet <name> --to <addr> --amount <n> --chain <chain>
@@ -254,6 +255,22 @@ nansen wallet forget-password                # drop the saved password from ever
 **Local wallets** are password-encrypted. Set `NANSEN_WALLET_PASSWORD` to skip the prompt.
 
 **Privy wallets** are server-side — no password, no local key storage. Requires `PRIVY_APP_ID` and `PRIVY_APP_SECRET` env vars. Get credentials at [dashboard.privy.io](https://dashboard.privy.io).
+
+**Ledger wallets** keep the keys on the device; nansen builds, prices and broadcasts each transaction and the Ledger only signs it. Setup:
+
+1. Install the optional peer packages next to `nansen-cli` (the CLI prints this command when they are missing):
+   ```bash
+   npm i -g @ledgerhq/device-management-kit@^1.9.1 @ledgerhq/device-transport-kit-node-hid@^1.0.1 \
+     @ledgerhq/device-signer-kit-ethereum@^1.18.1 @ledgerhq/device-signer-kit-solana@^1.13.2 \
+     @ledgerhq/context-module@^2.6.0 rxjs@7.8.2
+   ```
+2. Linux: install Ledger's [udev rules](https://github.com/LedgerHQ/udev-rules), otherwise the device is not visible without root.
+3. Install the Ethereum and Solana apps with Ledger Live, then **close Ledger Live** — it holds the USB session and nansen reports "Ledger is busy".
+4. Connect and unlock the Ledger, then `nansen wallet create --name cold --provider ledger` (or set `NANSEN_WALLET_PROVIDER=ledger`). It reads the first account on each chain (`44'/60'/0'/0/0`, `44'/501'/0'/0'`) and stores only the addresses.
+
+Supported with a Ledger wallet: `wallet list`/`show`/`default`/`delete`, `wallet send` (EVM + Solana), and `trade quote`/`execute` on Base and Solana — including cross-chain trades (`trade quote --to-chain`), where the Ledger signs the source-chain transaction. Keep the device connected and approve each signature on screen. If the device says it can't clear-sign a transaction, enable **Blind signing** in the Ethereum or Solana app settings on the Ledger and retry; cross-chain (Relay/LI.FI) transactions often need it.
+
+Known limitations (fail with `LEDGER_UNSUPPORTED`): x402 auto-payments, the `nansen bridge` commands (Hyperliquid deposits/withdrawals, which need off-chain EIP-712 signatures), `trade limit-order`, and `perp`. Cross-chain swaps through `nansen trade` are not affected. Use an API key (`nansen login`) or switch the default to a software wallet for those. `wallet export` does not apply — the keys never leave the device.
 
 ## MPP / Tempo
 

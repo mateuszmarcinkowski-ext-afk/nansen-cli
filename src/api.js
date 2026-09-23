@@ -1069,6 +1069,14 @@ export class NansenAPI {
               trace('x402.wallet_provider_lookup_failed', { error: err.message });
             }
 
+            // A Ledger can't sign the EIP-712 payment yet. Fail here rather than
+            // fall through to the local-key / WalletConnect chain below, which
+            // would pay from a different wallet than the default.
+            if (defaultWalletProvider === 'ledger') {
+              const { ledgerUnsupportedError } = await import('./ledger.js');
+              throw ledgerUnsupportedError('x402 auto-payment', 'Use an API key (nansen login), or set a software wallet as default: nansen wallet default <name>');
+            }
+
             if (defaultWalletProvider === 'privy') {
               // Default wallet is Privy: sign via Privy
               try {

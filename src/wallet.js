@@ -565,6 +565,62 @@ export function createWallet(name, password) {
   };
 }
 
+// Register a Ledger hardware wallet: a reference file holding its addresses
+// and derivation paths. The keys never leave the device, so there is nothing
+// to encrypt and no password is involved.
+export async function createLedgerWallet(name, { log = console.log } = {}) {
+  const walletFile = getWalletFile(name);
+  if (fs.existsSync(walletFile)) {
+    throw new Error(`Wallet "${name}" already exists`);
+  }
+
+  const { withLedger, LEDGER_PATHS } = await import('./ledger.js');
+  // Read each address once to print it, then again with verify so the user
+  // has something on screen to compare the device display against.
+  const [evmAddress, solanaAddress] = await withLedger(async (session) => {
+    const evm = await session.getEvmAddress();
+    log(`  EVM address:    ${evm}`);
+    const evmVerified = await session.getEvmAddress({ verify: true });
+    const solana = await session.getSolanaAddress();
+    log(`  Solana address: ${solana}`);
+    const solanaVerified = await session.getSolanaAddress({ verify: true });
+    if (evmVerified !== evm || solanaVerified !== solana) {
+      throw new CommandError('The Ledger returned a different address during verification. Nothing was saved; reconnect the device and retry.', 'WALLET_MISMATCH');
+    }
+    return [evm, solana];
+  });
+
+  ensureWalletsDir();
+  const config = getWalletConfig();
+  writeWalletJsonAtomic(walletFile, {
+    name,
+    provider: 'ledger',
+    evm: { address: evmAddress, path: LEDGER_PATHS.evm },
+    solana: { address: solanaAddress, path: LEDGER_PATHS.solana },
+    createdAt: new Date().toISOString(),
+  });
+
+  if (!config.defaultWallet) {
+    config.defaultWallet = name;
+  }
+  saveWalletConfig(config);
+
+  return {
+    name,
+    evm: evmAddress,
+    solana: solanaAddress,
+    paths: LEDGER_PATHS,
+    isDefault: config.defaultWallet === name,
+  };
+}
+
+function keyExportUnsupportedMessage(provider) {
+  if (provider === 'ledger') {
+    return 'Ledger wallets have no exportable keys: they never leave the device. Back up your Ledger with its recovery phrase instead.';
+  }
+  return `${provider} wallets don't support key export. Keys are managed by the provider.`;
+}
+
 /**
  * Show wallet details (addresses only, no keys).
  */
@@ -574,6 +630,7 @@ export function showWallet(name) {
   const data = readWalletJson(walletFile);
   const config = getWalletConfig();
   const isPrivy = data.provider === 'privy';
+  const isLedger = data.provider === 'ledger';
 
   return {
     name: data.name,
@@ -588,6 +645,12 @@ export function showWallet(name) {
         solana: data.solana?.privyWalletId,
       }
     } : {}),
+    ...(isLedger ? {
+      ledgerPaths: {
+        evm: data.evm?.path,
+        solana: data.solana?.path,
+      }
+    } : {}),
   };
 }
 
@@ -599,7 +662,7 @@ export function exportWallet(name, password) {
 
   const data = readWalletJson(walletFile);
   if (data.provider && data.provider !== 'local') {
-    throw new Error(`${data.provider} wallets don't support key export. Keys are managed by the provider.`);
+    throw new Error(keyExportUnsupportedMessage(data.provider));
   }
 
   const config = getWalletConfig();
@@ -699,6 +762,24 @@ export function buildWalletCommands(deps = {}) {
     'wallet': async (args, apiInstance, flags, options) => {
       const subcommand = args[0] || 'help';
       if (subcommand === 'create') rejectBlankOption(options.name, 'name', '<name>');
+
+      if (subcommand === 'create' && (options.provider || process.env.NANSEN_WALLET_PROVIDER) === 'ledger') {
+        const name = options.name || args[1] || 'default';
+        try {
+          const result = await createLedgerWallet(name, { log });
+          log(`\n✓ Ledger wallet "${result.name}" created\n`);
+          log(`  EVM:    ${result.evm}  (${result.paths.evm})`);
+          log(`  Solana: ${result.solana}  (${result.paths.solana})`);
+          if (result.isDefault) log(`  ★ Set as default wallet`);
+          log('');
+          log('  Private keys stay on the Ledger. Keep it connected and unlocked when sending.');
+          log('');
+          return;
+        } catch (err) {
+          if (err instanceof CommandError) throw err;
+          throw new CommandError(`❌ ${err.message}`, 'CREATE_FAILED');
+        }
+      }
 
       // Privy-specific: only 'create' and policy commands need --provider privy
       if (options.provider === 'privy' || process.env.NANSEN_WALLET_PROVIDER === 'privy') {
@@ -838,7 +919,7 @@ export function buildWalletCommands(deps = {}) {
           log('');
           for (const w of result.wallets) {
             const star = w.isDefault ? ' ★' : '';
-            const providerTag = w.provider === 'privy' ? ' (privy)' : '';
+            const providerTag = w.provider !== 'local' ? ` (${w.provider})` : '';
             log(`  ${w.name}${star}${providerTag}`);
             log(`    EVM:    ${w.evm}`);
             log(`    Solana: ${w.solana}`);
@@ -854,7 +935,7 @@ export function buildWalletCommands(deps = {}) {
           try {
             const result = showWallet(name);
             const star = result.isDefault ? ' ★' : '';
-            const providerTag = result.provider === 'privy' ? ' (privy)' : '';
+            const providerTag = result.provider !== 'local' ? ` (${result.provider})` : '';
             log(`\n  ${result.name}${star}${providerTag}`);
             log(`    EVM:    ${result.evm}`);
             log(`    Solana: ${result.solana}`);
@@ -889,7 +970,7 @@ export function buildWalletCommands(deps = {}) {
             try {
               const result = showWallet(name);
               if (result.provider !== 'local') {
-                throw new Error(`${result.provider} wallets don't support key export. Keys are managed by the provider.`);
+                throw new Error(keyExportUnsupportedMessage(result.provider));
               }
               log(`\n  Wallet "${result.name}" — private keys are NOT shown by default.\n`);
               log(`  EVM:`);
@@ -1016,18 +1097,18 @@ export function buildWalletCommands(deps = {}) {
             throw new CommandError('Usage: nansen wallet delete <name>', 'MISSING_ARGS');
           }
 
-          // Check if this is a Privy wallet (no password needed).
+          // Check if this is a Privy or Ledger wallet (no password needed).
           // getWalletFile() runs validateWalletName(), which rejects any name
           // outside [a-zA-Z0-9_-]{1,64} — so the path is confined to the wallets
           // dir and cannot traverse. deleteWallet() re-validates below.
-          let isPrivy = false;
+          let provider = 'local';
           try {
-            const data = readWalletJson(getWalletFile(name));
-            if (data.provider === 'privy') isPrivy = true;
+            provider = readWalletJson(getWalletFile(name)).provider || 'local';
           } catch { /* invalid/missing name; deleteWallet will validate and throw */ }
+          const isPrivy = provider === 'privy';
 
           let password = null;
-          if (!isPrivy) {
+          if (provider === 'local') {
             const config = getWalletConfig();
             const resolved = await resolvePasswordForCommand(config, flags, deps);
             if (resolved.error) {
@@ -1041,6 +1122,9 @@ export function buildWalletCommands(deps = {}) {
             log(`✓ Wallet "${result.deleted}" deleted`);
             if (isPrivy) {
               log(`  Note: server-side wallet still exists on Privy`);
+            }
+            if (provider === 'ledger') {
+              log(`  Note: the keys stay on your Ledger; re-add it with: nansen wallet create --provider ledger`);
             }
             if (result.newDefault) {
               log(`  New default: ${result.newDefault}`);
@@ -1075,8 +1159,8 @@ export function buildWalletCommands(deps = {}) {
 
           const isWalletConnect = options.wallet === 'walletconnect' || options.wallet === 'wc';
 
-          // Check if the wallet is Privy (no password needed)
-          let isPrivyWallet = false;
+          // Privy and Ledger wallets hold no local keys (no password needed)
+          let isKeylessWallet = false;
           if (!isWalletConnect) {
             try {
               const walletName = options.wallet || getWalletConfig().defaultWallet;
@@ -1085,13 +1169,13 @@ export function buildWalletCommands(deps = {}) {
                 // the wallets dir; an invalid name throws and is ignored here, and
                 // the real wallet load downstream validates again.
                 const data = readWalletJson(getWalletFile(walletName));
-                if (data.provider === 'privy') isPrivyWallet = true;
+                if (data.provider === 'privy' || data.provider === 'ledger') isKeylessWallet = true;
               }
             } catch { /* ignore */ }
           }
 
           let password;
-          if (isWalletConnect || isPrivyWallet) {
+          if (isWalletConnect || isKeylessWallet) {
             password = null;
           } else {
             const sendConfig = getWalletConfig();
@@ -1143,6 +1227,8 @@ export function buildWalletCommands(deps = {}) {
             log('');
             return;
           } catch (err) {
+            // Ledger errors carry their own code (LEDGER_REJECTED, WALLET_MISMATCH...)
+            if (err instanceof CommandError) throw err;
             throw new CommandError(err.message, 'SEND_FAILED');
           }
         },
@@ -1222,13 +1308,13 @@ export function buildWalletCommands(deps = {}) {
 
         'help': async () => {
           log(`
-Wallet Management - EVM and Solana wallets (local or Privy server-side)
+Wallet Management - EVM and Solana wallets (local, Privy server-side, or Ledger hardware)
 
 USAGE:
   nansen wallet <command> [options]
 
 COMMANDS:
-  create [--name <label>] [--provider <local|privy>] [--unsafe-no-password]
+  create [--name <label>] [--provider <local|privy|ledger>] [--unsafe-no-password]
                              Create a new wallet pair (EVM + Solana)
   list                       List all wallets
   show <name>                Show wallet addresses
@@ -1245,8 +1331,10 @@ COMMANDS:
 
 OPTIONS:
   --name <label>             Wallet name (default: "default")
-  --provider <local|privy>   Wallet provider: "local" (default) stores encrypted keys on disk,
-                             "privy" creates server-side wallets via Privy API
+  --provider <local|privy|ledger>
+                             Wallet provider: "local" (default) stores encrypted keys on disk,
+                             "privy" creates server-side wallets via Privy API,
+                             "ledger" uses a Ledger over USB (keys stay on the device)
   --to <address>             Recipient address (required for send)
   --amount <number>          Amount to send in human-readable format (required unless --max)
   --chain <evm|solana>       Blockchain to use (required for send)
@@ -1267,7 +1355,7 @@ ENVIRONMENT:
   NANSEN_WALLET_PASSWORD     Wallet encryption password
   PRIVY_APP_ID               Privy application ID (required for --provider privy)
   PRIVY_APP_SECRET           Privy application secret (required for --provider privy)
-  NANSEN_WALLET_PROVIDER     Default provider for wallet create ("local" or "privy")
+  NANSEN_WALLET_PROVIDER     Default provider for wallet create ("local", "privy" or "ledger")
   NANSEN_EVM_RPC            Custom Ethereum RPC endpoint (also generic EVM fallback)
   NANSEN_BASE_RPC           Custom Base RPC endpoint
   NANSEN_SOLANA_RPC         Custom Solana RPC endpoint
@@ -1277,6 +1365,7 @@ ENVIRONMENT:
 EXAMPLES:
   NANSEN_WALLET_PASSWORD=mypass nansen wallet create --name trading
   nansen wallet create --name agent-wallet --provider privy
+  nansen wallet create --name cold --provider ledger
   nansen wallet list
   nansen wallet export trading                     # redacted (addresses only)
   nansen wallet export trading --file backup.json  # keys → 0600 file, nothing on stdout

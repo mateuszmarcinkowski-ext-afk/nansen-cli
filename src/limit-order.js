@@ -27,6 +27,7 @@ import {
 import { validateTokenAddress, telemetryHeaders, packageVersion } from './api.js';
 import { getWalletConnectAddress, sendSolanaTransactionViaWalletConnect, signSolanaMessageViaWalletConnect } from './walletconnect-trading.js';
 import { retrievePassword } from './keychain.js';
+import { ledgerUnsupportedError } from './ledger.js';
 import { CHAIN_RPCS } from './rpc-urls.js';
 
 // ============= Constants =============
@@ -321,6 +322,8 @@ export async function resolveSolanaWallet(walletName, deps = {}) {
     exit(1);
     return null;
   }
+
+  if (wallet.provider === 'ledger') throw ledgerUnsupportedError('Limit-order trading');
 
   if (wallet.provider === 'privy') {
     const { PrivyClient } = await import('./privy.js');

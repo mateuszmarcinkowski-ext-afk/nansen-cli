@@ -24,6 +24,7 @@ import { simulateAssetChanges, SwapSimulationError, hasSimulationRpc } from './s
 import { simulateSolanaAssetChanges, SolanaSimulationError, hasSolanaSimulationRpc } from './solana-simulation.js';
 import { packageVersion, CommandError, telemetryHeaders, loadConfig } from './api.js';
 import { screenOrThrow } from './perp.js';
+import { withLedger } from './ledger.js';
 
 // ============= Constants =============
 
@@ -632,6 +633,19 @@ export function signSolanaTransaction(transactionBase64, privateKeyHex) {
   return signedTx.toString('base64');
 }
 
+// Same slot-0 (fee payer) write as signSolanaTransaction, with the Ed25519
+// signature produced on the Ledger over the full wire transaction.
+async function signSolanaTransactionWithLedger(ledger, account, transactionBase64) {
+  const signedTx = Buffer.from(transactionBase64, 'base64');
+  const signature = await (await ledger.session()).signSolanaTransaction(account, signedTx);
+  if (signature.length !== 64) {
+    throw new Error(`Invalid Ed25519 signature length from the Ledger: expected 64 bytes, got ${signature.length}`);
+  }
+  const { size: sigCountSize } = readCompactU16(signedTx, 0);
+  signature.copy(signedTx, sigCountSize);
+  return signedTx.toString('base64');
+}
+
 // Any valid base58 32-byte value works here — recentBlockhash is fixed-size
 // regardless of its actual value, so this is exact for a size-only preflight
 // and lets the signer/signature-count checks below run before the real
@@ -771,6 +785,13 @@ export async function normalizeSolanaTransaction(transaction, rpcUrl, getExpecte
 // Pure EVM encode/sign primitive. Quote authorization and request-intent binding
 // happen upstream before this function receives transaction calldata.
 export function signEvmTransaction(txData, privateKeyHex, chain, nonce) {
+  return signEvmTransactionFields(buildEvmTransactionFields(txData, chain, nonce), privateKeyHex);
+}
+
+// Unsigned transaction fields for a quote's transaction: type 2 when the quote
+// carries fee caps, legacy for a gasPrice-only quote. Shared by the local and
+// Ledger signers so both sign exactly the same transaction.
+function buildEvmTransactionFields(txData, chain, nonce) {
   const chainConfig = CHAIN_MAP[chain];
   if (!chainConfig || chainConfig.type !== 'evm') {
     throw new Error(`Unsupported EVM chain: ${chain}`);
@@ -786,20 +807,33 @@ export function signEvmTransaction(txData, privateKeyHex, chain, nonce) {
   };
 
   if (txData.maxFeePerGas) {
-    return signEip1559Transaction({
+    return {
       ...common,
       maxFeePerGas: toHex(txData.maxFeePerGas),
       // A zero priority fee is a valid choice but not a sane default, so fall
       // back to the fee cap rather than to nothing when the quote omits it.
       maxPriorityFeePerGas: toHex(txData.maxPriorityFeePerGas || txData.maxFeePerGas),
-    }, privateKeyHex);
+    };
   }
 
   // A gasPrice-only quote stays a legacy transaction; a quote with no fee
   // information at all is refused (see NO_QUOTE_FEE_MESSAGE).
   if (!txData.gasPrice) throw new Error(NO_QUOTE_FEE_MESSAGE);
 
-  return signLegacyTransaction({ ...common, gasPrice: toHex(txData.gasPrice) }, privateKeyHex);
+  return { ...common, gasPrice: toHex(txData.gasPrice) };
+}
+
+function signEvmTransactionFields(tx, privateKeyHex) {
+  return tx.maxFeePerGas ? signEip1559Transaction(tx, privateKeyHex) : signLegacyTransaction(tx, privateKeyHex);
+}
+
+// The Ledger signs the same unsigned bytes the local signer hashes; nansen
+// still assembles the signed envelope from the returned { r, s, v }.
+async function signEvmTransactionWithLedger(ledger, account, tx) {
+  const isEip1559 = Boolean(tx.maxFeePerGas);
+  const unsignedPayload = isEip1559 ? eip1559SigningPayload(tx) : legacySigningPayload(tx);
+  const signature = await (await ledger.session()).signEvmTransaction(account, unsignedPayload);
+  return isEip1559 ? assembleEip1559Transaction(tx, signature) : assembleLegacyTransaction(tx, signature);
 }
 
 // Previously the signers fell back to a hardcoded gas price (1 wei here, then
@@ -1000,6 +1034,39 @@ function isFatalBroadcastError(err) {
     || err?.code === 'INVALID_SIGNED_TX'
     || err?.code === 'RECEIPT_TIMEOUT'
     || err?.code === 'BROADCAST_FAILED';
+}
+
+// A Ledger failure (rejected on the device, locked, unplugged, a different
+// Ledger) would recur on the next quote and prompt the user again, so it ends
+// the run instead of falling through to the next candidate.
+function isLedgerError(err) {
+  return typeof err?.code === 'string' && (err.code.startsWith('LEDGER_') || err.code === 'WALLET_MISMATCH');
+}
+
+// withLedger() scopes one USB session to a callback, but execute signs at
+// several points of its quote loop (revoke, approve, swap). Open the session at
+// the first signature — after every pre-signing check — and hold it until
+// close(), so the user connects once per run.
+function lazyLedgerSession() {
+  let release;
+  const released = new Promise((resolve) => { release = resolve; });
+  let opened = null;
+  let finished = Promise.resolve();
+  return {
+    session() {
+      opened ??= new Promise((resolve, reject) => {
+        finished = withLedger((session) => {
+          resolve(session);
+          return released;
+        }).catch(reject);
+      });
+      return opened;
+    },
+    close() {
+      release();
+      return finished;
+    },
+  };
 }
 
 /**
@@ -1651,7 +1718,14 @@ export function assertUsableSpender(spenderAddress) {
 // amount from approvalAmountForSwap or, for excessive-allowance cleanup, an
 // explicit allowZero revoke. encodeApproveCalldata validates the spender,
 // amount, optional request cap, and final ABI width before signing.
-export function buildApprovalTransaction(tokenAddress, spenderAddress, privateKeyHex, chain, nonce, gasPrice, amount, maxAllowance, { allowZero = false } = {}) {
+export function buildApprovalTransaction(tokenAddress, spenderAddress, privateKeyHex, chain, nonce, gasPrice, amount, maxAllowance, opts) {
+  return signLegacyTransaction(
+    buildApprovalTransactionFields(tokenAddress, spenderAddress, chain, nonce, gasPrice, amount, maxAllowance, opts),
+    privateKeyHex,
+  );
+}
+
+function buildApprovalTransactionFields(tokenAddress, spenderAddress, chain, nonce, gasPrice, amount, maxAllowance, { allowZero = false } = {}) {
   const chainConfig = CHAIN_MAP[chain];
   if (!chainConfig) throw new Error(`Unsupported chain: ${chain}`);
 
@@ -1665,7 +1739,7 @@ export function buildApprovalTransaction(tokenAddress, spenderAddress, privateKe
   // amount within the request cap, and exactly-68-byte calldata.
   const data = encodeApproveCalldata(spenderAddress, amount, { maxAllowance, allowZero });
 
-  const tx = {
+  return {
     nonce,
     gasPrice: toHex(gasPrice),
     gasLimit: '0x186a0', // 100000
@@ -1674,8 +1748,6 @@ export function buildApprovalTransaction(tokenAddress, spenderAddress, privateKe
     data,
     chainId: chainConfig.chainId,
   };
-
-  return signLegacyTransaction(tx, privateKeyHex);
 }
 
 // ============= Legacy (Type 0) EVM Transaction Signing =============
@@ -1700,8 +1772,15 @@ export function stripLeadingZeros(buf) {
  * @returns {string} 0x-prefixed signed transaction hex
  */
 export function signLegacyTransaction(tx, privateKeyHex) {
-  // EIP-155 unsigned: RLP([nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0])
-  const unsignedFields = [
+  const msgHash = keccak256(legacySigningPayload(tx));
+
+  // Sign with secp256k1
+  return assembleLegacyTransaction(tx, signSecp256k1(msgHash, Buffer.from(privateKeyHex, 'hex')));
+}
+
+// EIP-155 unsigned: RLP([nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0])
+function legacySigningPayload(tx) {
+  return rlpEncode([
     rlpNormalize(tx.nonce),
     rlpNormalize(tx.gasPrice),
     rlpNormalize(tx.gasLimit),
@@ -1711,14 +1790,10 @@ export function signLegacyTransaction(tx, privateKeyHex) {
     rlpNormalize(tx.chainId),
     Buffer.alloc(0), // EIP-155: empty for signing
     Buffer.alloc(0), // EIP-155: empty for signing
-  ];
+  ]);
+}
 
-  const unsignedPayload = rlpEncode(unsignedFields);
-  const msgHash = keccak256(unsignedPayload);
-
-  // Sign with secp256k1
-  const { r, s, v: recoveryBit } = signSecp256k1(msgHash, Buffer.from(privateKeyHex, 'hex'));
-
+function assembleLegacyTransaction(tx, { r, s, v: recoveryBit }) {
   // EIP-155 v = chainId * 2 + 35 + recoveryBit
   const v = tx.chainId * 2 + 35 + recoveryBit;
 
@@ -1753,7 +1828,12 @@ export function signLegacyTransaction(tx, privateKeyHex) {
  * the chain id is already a first-class field in the payload.
  */
 export function signEip1559Transaction(tx, privateKeyHex) {
-  const payloadFields = [
+  const msgHash = keccak256(eip1559SigningPayload(tx));
+  return assembleEip1559Transaction(tx, signSecp256k1(msgHash, Buffer.from(privateKeyHex, 'hex')));
+}
+
+function eip1559PayloadFields(tx) {
+  return [
     rlpNormalize(tx.chainId),
     rlpNormalize(tx.nonce),
     rlpNormalize(tx.maxPriorityFeePerGas),
@@ -1764,14 +1844,17 @@ export function signEip1559Transaction(tx, privateKeyHex) {
     toBuffer(tx.data || '0x'),
     [], // accessList — always empty; we never build access-listed transactions
   ];
+}
 
-  const msgHash = keccak256(Buffer.concat([Buffer.from([0x02]), rlpEncode(payloadFields)]));
-  const { r, s, v: recoveryBit } = signSecp256k1(msgHash, Buffer.from(privateKeyHex, 'hex'));
+function eip1559SigningPayload(tx) {
+  return Buffer.concat([Buffer.from([0x02]), rlpEncode(eip1559PayloadFields(tx))]);
+}
 
+function assembleEip1559Transaction(tx, { r, s, v: recoveryBit }) {
   const signed = Buffer.concat([
     Buffer.from([0x02]),
     rlpEncode([
-      ...payloadFields,
+      ...eip1559PayloadFields(tx),
       rlpNormalize(recoveryBit),
       stripLeadingZeros(r),
       stripLeadingZeros(s),
@@ -2171,6 +2254,8 @@ export async function buildTradeExecutionPlan({
   ]);
 }
 
+const LEDGER_GASLESS_MESSAGE = 'Gasless swaps are not supported with a Ledger wallet. Omit --gasless, or use a local or Privy wallet.';
+
 /**
  * Run every execute validation that can be completed from a cached quote,
  * public signer address, and read-only RPC calls. This intentionally does not
@@ -2188,6 +2273,7 @@ async function preflightTradeExecutionCandidate({
   chainConfig,
   walletAddress,
   isWalletConnect,
+  isLedger,
   gasless,
   noSimulate,
   noVerifyOutcome,
@@ -2206,6 +2292,9 @@ async function preflightTradeExecutionCandidate({
       'Gasless swaps are not supported via WalletConnect. Use a local or Privy wallet.',
       'GASLESS_UNSUPPORTED_WALLET',
     );
+  }
+  if (gasless && isLedger) {
+    throw new CommandError(LEDGER_GASLESS_MESSAGE, 'GASLESS_UNSUPPORTED_WALLET');
   }
 
   if (!walletAddress) {
@@ -2614,6 +2703,8 @@ CROSS-CHAIN NOTES (when using --to-chain):
           if (wallet.provider === 'privy') {
             walletProvider = 'privy';
             privyWalletIds = wallet.privyWalletIds;
+          } else if (wallet.provider === 'ledger') {
+            walletProvider = 'ledger';
           }
         } else {
           try {
@@ -2624,6 +2715,8 @@ CROSS-CHAIN NOTES (when using --to-chain):
               if (wallet.provider === 'privy') {
                 walletProvider = 'privy';
                 privyWalletIds = wallet.privyWalletIds;
+              } else if (wallet.provider === 'ledger') {
+                walletProvider = 'ledger';
               }
             }
           } catch {
@@ -2925,6 +3018,7 @@ EXAMPLES:
   nansen trade execute --quote 1708900000000-abc123 --yes`, 'MISSING_ARGS');
       }
 
+      let ledger = null;
       try {
         const quoteData = loadQuote(quoteId);
         const chain = quoteData.chain;
@@ -2971,6 +3065,7 @@ EXAMPLES:
         const shouldPreflightPlan = guard.dryRun || (guard.isTTY && !guard.assumeYes);
         const planUsesWalletConnect = quoteData.signerType === 'walletconnect'
           || walletName === 'walletconnect' || walletName === 'wc';
+        const planUsesLedger = !planUsesWalletConnect && quoteData.signerType === 'ledger';
         if (guard.dryRun) {
           // The live signer is intentionally unavailable here: dry-run reaches
           // this gate before wallet material or a WalletConnect session is
@@ -3007,6 +3102,7 @@ EXAMPLES:
                 chainConfig,
                 walletAddress: planWallet,
                 isWalletConnect: planUsesWalletConnect,
+                isLedger: planUsesLedger,
                 gasless,
                 noSimulate,
                 noVerifyOutcome,
@@ -3077,17 +3173,61 @@ EXAMPLES:
         const isWalletConnect = quoteData.signerType === 'walletconnect'
           || walletName === 'walletconnect' || walletName === 'wc';
         const isPrivy = quoteData.signerType === 'privy';
+        const isLedger = !isWalletConnect && quoteData.signerType === 'ledger';
 
         let exported = null;
+        // Ledger: the stored account ({ address, path }) this quote was built
+        // for. The device's own address is checked against it at each signature.
+        let ledgerAccount = null;
         let privyClient = null;
         // The wallet resolved before the per-quote loop, for the pre-signing
         // compliance screen below. Stays null for Privy, whose address is
         // fetched from the provider inside the loop.
         let signerAddress = null;
+        // A software-wallet quote named a Ledger wallet: refuse with the fix
+        // rather than trying to export keys from a record that holds none.
+        if (!isLedger && !isWalletConnect) {
+          const softwareWalletName = walletName || (isPrivy ? null : getWalletConfig().defaultWallet);
+          const namedWallet = softwareWalletName && listWallets().wallets.find(w => w.name === softwareWalletName);
+          if (namedWallet?.provider === 'ledger') {
+            throw new CommandError(`This quote was built for a software wallet, but "${softwareWalletName}" is a Ledger wallet. Get a new quote with --wallet ${softwareWalletName}`, 'WALLET_MISMATCH');
+          }
+        }
+
         if (isPrivy) {
           // Privy signing -- import + instantiate once for all quotes
           const { PrivyClient } = await import('./privy.js');
           privyClient = new PrivyClient(process.env.PRIVY_APP_ID, process.env.PRIVY_APP_SECRET);
+        } else if (isLedger) {
+          // No key material to load: resolve the Ledger wallet record and bind
+          // it to the quote before anything is screened, built or signed.
+          const ledgerWalletName = walletName || getWalletConfig().defaultWallet;
+          if (!ledgerWalletName) {
+            throw new CommandError('No wallet found. This quote was built for a Ledger wallet; pass it with --wallet <name>.', 'NO_WALLET');
+          }
+          const wallet = showWallet(ledgerWalletName);
+          if (wallet.provider !== 'ledger') {
+            throw new CommandError(`Quote was built for a Ledger wallet, but "${ledgerWalletName}" is a ${wallet.provider} wallet. Re-run with --wallet <ledger wallet>, or get a new quote with --wallet ${ledgerWalletName}.`, 'WALLET_MISMATCH');
+          }
+          ledgerAccount = chainType === 'solana'
+            ? { address: wallet.solana, path: wallet.ledgerPaths?.solana }
+            : { address: wallet.evm, path: wallet.ledgerPaths?.evm };
+          if (!ledgerAccount.address) {
+            throw new CommandError(
+              `Could not resolve the Ledger wallet's ${chainType === 'solana' ? 'Solana' : 'EVM'} address; cannot confirm the quote was built for this wallet. Refusing to sign. Recreate it with: nansen wallet create --provider ledger --name ${ledgerWalletName}`,
+              'NO_WALLET',
+            );
+          }
+          const quoteWallet = quoteData.request?.walletAddress
+            || quoteData.response?.quotes?.[0]?.transaction?.from
+            || quoteData.response?.metadata?.userWalletAddress;
+          if (quoteWallet && (chainType === 'solana'
+            ? ledgerAccount.address.trim() !== quoteWallet.trim()
+            : ledgerAccount.address.toLowerCase().trim() !== quoteWallet.toLowerCase().trim())) {
+            throw new CommandError(`Ledger wallet "${ledgerWalletName}" (${ledgerAccount.address}) doesn't match quote. Get a new quote with --wallet ${ledgerWalletName}`, 'WALLET_MISMATCH');
+          }
+          signerAddress = ledgerAccount.address;
+          ledger = lazyLedgerSession();
         } else if (!isWalletConnect) {
           // Get wallet credentials once (before the loop)
           const walletConfig = getWalletConfig();
@@ -3207,6 +3347,9 @@ EXAMPLES:
                 'Gasless swaps are not supported via WalletConnect (mobile wallets typically auto-broadcast, breaking the gasless flow). Use a local or Privy wallet.',
                 'GASLESS_UNSUPPORTED_WALLET'
               );
+            }
+            if (isLedger) {
+              throw new CommandError(LEDGER_GASLESS_MESSAGE, 'GASLESS_UNSUPPORTED_WALLET');
             }
           }
 
@@ -3539,6 +3682,8 @@ EXAMPLES:
                 if (!solanaWalletAddress) {
                   throw new CommandError('WalletConnect session lost during execute. Reconnect with `walletconnect connect` and retry.', 'NO_WALLET');
                 }
+              } else if (isLedger) {
+                solanaWalletAddress = ledgerAccount.address;
               } else {
                 solanaWalletAddress = exported.solana.address;
                 // Fail closed if the signer address doesn't resolve: without it the
@@ -3615,6 +3760,9 @@ EXAMPLES:
                 } else {
                   throw new Error('WalletConnect returned neither signedTransaction nor signature');
                 }
+              } else if (isLedger) {
+                log('  Signing Solana transaction on your Ledger...');
+                signedTransaction = await signSolanaTransactionWithLedger(ledger, ledgerAccount, txBase64);
               } else {
                 log('  Signing Solana transaction...');
                 signedTransaction = signSolanaTransaction(txBase64, exported.solana.privateKey);
@@ -3972,8 +4120,13 @@ EXAMPLES:
               signedTransaction = wcResult.signedTransaction;
 
             } else {
-              // EVM: quote.transaction is { to, data, value, gas, gasPrice }
-              const walletAddress = exported.evm.address;
+              // EVM: quote.transaction is { to, data, value, gas, gasPrice }.
+              // Local key or Ledger: same checks, nonce, fees and broadcast;
+              // only the signature source differs.
+              const walletAddress = isLedger ? ledgerAccount.address : exported.evm.address;
+              const signEvm = (tx) => (isLedger
+                ? signEvmTransactionWithLedger(ledger, ledgerAccount, tx)
+                : signEvmTransactionFields(tx, exported.evm.privateKey));
 
               // Guard the swap target before any RPC call, approval, or signing —
               // whatever `to`/`data` the quote supplied gets signed verbatim, so
@@ -4064,17 +4217,16 @@ EXAMPLES:
                     log(`  ⚠ Existing allowance (${existingAllowance}) for ${quoteName} is excessive (>${OVERSIZED_ALLOWANCE_MULTIPLIER}x this trade) — revoking before re-approving`);
                     log(`  Sending allowance revocation tx...`);
                     const revokeNonce = await getEvmNonce(chain, walletAddress);
-                    const revokeTxHex = buildApprovalTransaction(
+                    const revokeTxHex = await signEvm(buildApprovalTransactionFields(
                       currentQuote.inputMint,
                       currentQuote.approvalAddress,
-                      exported.evm.privateKey,
                       chain,
                       revokeNonce,
                       approvalGasPrice,
                       0n,
                       undefined,
                       { allowZero: true },
-                    );
+                    ));
 
                     const revokeResult = await executeTransaction({
                       signedTransaction: revokeTxHex,
@@ -4114,16 +4266,15 @@ EXAMPLES:
                   log(`  Sending approval tx...`);
                   const approvalNonce = await getEvmNonce(chain, walletAddress);
 
-                  const approvalTxHex = buildApprovalTransaction(
+                  const approvalTxHex = await signEvm(buildApprovalTransactionFields(
                     currentQuote.inputMint,
                     currentQuote.approvalAddress,
-                    exported.evm.privateKey,
                     chain,
                     approvalNonce,
                     approvalGasPrice,
                     approveAmt,
                     approvalCapForQuote(quoteData),
-                  );
+                  ));
 
                   const approvalResult = await executeTransaction({
                     signedTransaction: approvalTxHex,
@@ -4209,13 +4360,8 @@ EXAMPLES:
               const nonce = await getEvmNonce(chain, walletAddress);
               log(`  Nonce: ${nonce}`);
 
-              log('  Signing EVM transaction...');
-              signedTransaction = signEvmTransaction(
-                currentQuote.transaction,
-                exported.evm.privateKey,
-                chain,
-                nonce
-              );
+              log(isLedger ? '  Signing EVM transaction on your Ledger...' : '  Signing EVM transaction...');
+              signedTransaction = await signEvm(buildEvmTransactionFields(currentQuote.transaction, chain, nonce));
             }
 
             log(gasless ? '  Forwarding to Relay solver (gasless)...' : '  Broadcasting...');
@@ -4419,6 +4565,7 @@ EXAMPLES:
             // timeout, or an ambiguous broadcast failure). See
             // isFatalBroadcastError.
             if (isFatalBroadcastError(quoteErr)) throw quoteErr;
+            if (isLedger && isLedgerError(quoteErr)) throw quoteErr;
             const msg = quoteErr.message || '';
             log(`  ❌ Quote ${quoteName} failed: ${msg}`);
             if (msg.includes('AccountNotFound') && chainType === 'solana') {
@@ -4437,6 +4584,8 @@ EXAMPLES:
         let msg = `Error: ${err.message}`;
         if (err.details) msg += `\n  Details: ${JSON.stringify(err.details)}`;
         throw new CommandError(msg, err.code || 'EXECUTE_ERROR');
+      } finally {
+        await ledger?.close();
       }
     },
 

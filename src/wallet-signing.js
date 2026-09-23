@@ -14,6 +14,7 @@
 
 import { CommandError } from './api.js';
 import { retrievePassword } from './keychain.js';
+import { ledgerUnsupportedError } from './ledger.js';
 import { exportWallet, getWalletConfig, showWallet } from './wallet.js';
 
 const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
@@ -78,8 +79,10 @@ export function resolvePrivateKey(wallet) {
 
 // Signing material for an already-resolved wallet. Privy wallets have no
 // exportable key — the caller signs through the Privy client instead, using the
-// privyWalletIds already on `wallet`.
+// privyWalletIds already on `wallet`. Ledger wallets can't sign the bridge's
+// EIP-712 steps yet.
 export function resolveSigningCredentials(wallet) {
+  if (wallet.provider === 'ledger') throw ledgerUnsupportedError('Bridging');
   if (wallet.provider === 'privy') {
     return { provider: 'privy', privateKey: null };
   }

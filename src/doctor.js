@@ -10,9 +10,11 @@
  */
 
 import fs from 'fs';
+import { createRequire } from 'module';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { passwordSource } from './keychain.js';
+import { LEDGER_INSTALL_COMMAND } from './ledger.js';
 import { isNewer } from './update-check.js';
 import { isTelemetryDisabled } from './telemetry.js';
 
@@ -375,6 +377,15 @@ export function runDoctorChecks(deps = {}) {
     const hasPrivyWallet = walletInfo.wallets.some(w => w.provider === 'privy');
     if (hasPrivyWallet && (!env.PRIVY_APP_ID || !env.PRIVY_APP_SECRET)) {
       checks.push(check('privy-env', 'warn', 'Privy wallet present but PRIVY_APP_ID / PRIVY_APP_SECRET are not set', 'Export both env vars to use Privy wallets'));
+    }
+
+    // Ledger wallets need the optional @ledgerhq peer packages
+    if (walletInfo.wallets.some(w => w.provider === 'ledger')) {
+      let resolvable = true;
+      try { createRequire(import.meta.url).resolve('@ledgerhq/device-management-kit'); } catch { resolvable = false; }
+      if (!resolvable) {
+        checks.push(check('ledger-deps', 'warn', 'Ledger wallet present but the Ledger packages are not installed', `Run: ${LEDGER_INSTALL_COMMAND}`));
+      }
     }
   }
 

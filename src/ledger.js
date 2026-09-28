@@ -43,6 +43,7 @@ export const LEDGER_INSTALL_COMMAND = `npm i -g ${LEDGER_PACKAGES.join(' ')}`;
 const PROMPTS = {
   'unlock-device': 'ACTION REQUIRED: Unlock your Ledger with your PIN',
   'confirm-open-app': 'ACTION REQUIRED: Confirm opening the app on your Ledger',
+  'web3-checks-opt-in': 'ACTION REQUIRED: Choose whether to enable transaction checks on your Ledger (asked once)',
   'verify-address': 'ACTION REQUIRED: Check the address on your Ledger matches the one shown here, then approve',
   'sign-transaction': 'ACTION REQUIRED: Review and approve the transaction on your Ledger',
   'sign-typed-data': 'ACTION REQUIRED: Review and approve the message on your Ledger',
@@ -61,10 +62,33 @@ export function ledgerUnsupportedError(feature, hint = 'Use a software wallet in
   return new CommandError(`Ledger wallets don't support ${feature} yet. ${hint}`, 'LEDGER_UNSUPPORTED');
 }
 
+const LEDGER_VENDOR_ID = 0x2c97;
+const APDU_USAGE_PAGE = 0xffa0;
+
+// Ledgers with a FIDO app (Flex, Stax, Nano X) expose two HID interfaces: APDU
+// and FIDO. On Linux the transport keeps both and then dedupes them by
+// vendorId:productId, so the FIDO interface (enumerated last) wins and every
+// command fails with ReceiverApduError — the session just sits BUSY. It only
+// filters by usage page on macOS/Windows. Apply the same filter to node-hid
+// before the transport captures it at load time.
+// todo: remove once device-transport-kit-node-hid filters by usage page on Linux.
+function keepOnlyApduInterface() {
+  const transportRequire = createRequire(require.resolve('@ledgerhq/device-transport-kit-node-hid'));
+  const hid = transportRequire('node-hid');
+  if (hid.devicesAsync.nansenApduOnly) return;
+  const devicesAsync = hid.devicesAsync;
+  const apduOnly = async (...args) => (await devicesAsync(...args))
+    .filter((d) => d.vendorId !== LEDGER_VENDOR_ID || !d.usagePage || d.usagePage === APDU_USAGE_PAGE);
+  apduOnly.nansenApduOnly = true;
+  hid.devicesAsync = apduOnly;
+}
+
 function loadLedgerKit() {
   try {
+    const dmk = require('@ledgerhq/device-management-kit');
+    keepOnlyApduInterface();
     return {
-      dmk: require('@ledgerhq/device-management-kit'),
+      dmk,
       transport: require('@ledgerhq/device-transport-kit-node-hid'),
       eth: require('@ledgerhq/device-signer-kit-ethereum'),
       solana: require('@ledgerhq/device-signer-kit-solana'),
@@ -128,17 +152,25 @@ function toLedgerError(err, { label, app, blindSigningFallback = false }) {
   if (code === '6985' || code === '5501' || tag === 'RefusedByUserDAError' || tag === 'ActionRefusedError') {
     return new CommandError(`${label} was rejected on the Ledger. Nothing was signed.`, 'LEDGER_REJECTED', null, { cause: err });
   }
+  if (tag === 'NoAccessibleDeviceError') {
+    return new CommandError('No Ledger found. Plug it in over USB, unlock it, and retry.', 'LEDGER_NOT_FOUND', null, { cause: err });
+  }
   if (code === '5515' || tag === 'DeviceLockedError') {
     return new CommandError('Ledger is locked. Unlock it with your PIN and retry.', 'LEDGER_LOCKED', null, { cause: err });
   }
   if (code === '6807') {
     return new CommandError(`The ${app} app is not installed on your Ledger. Install it with Ledger Live and retry.`, 'LEDGER_APP_MISSING', null, { cause: err });
   }
-  if (blindSigningFallback) {
+  // 6a80 is how the Ethereum app refuses a transaction it would have to blind
+  // sign while Blind signing is off. Only trust it after the SDK fell back to
+  // blind signing — any other failure there (unplugged, app crash) is not a
+  // settings problem.
+  if (blindSigningFallback && code === '6a80') {
     return blindSigningError(app, err);
   }
   const detail = err instanceof Error ? err.message : (err?.message || tag || JSON.stringify(err));
-  return new CommandError(`${label} failed on the Ledger: ${detail}`, 'LEDGER_ERROR', null, { cause: err });
+  const suffix = code ? ` (status ${code})` : '';
+  return new CommandError(`${label} failed on the Ledger: ${detail}${suffix}`, 'LEDGER_ERROR', null, { cause: err });
 }
 
 function blindSigningError(app, cause) {

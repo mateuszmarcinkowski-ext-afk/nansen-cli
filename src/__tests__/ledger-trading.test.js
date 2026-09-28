@@ -107,8 +107,19 @@ function fakeLedgerSession({ evmKey = EVM_KEY, events = [] } = {}) {
   };
 }
 
+// Counts sessions opened and released. The callback's promise only settles when
+// execute calls close(), so an unreleased session is a leaked USB connection.
 function useLedger(session) {
-  withLedger.mockImplementation(async (fn) => fn(session));
+  const usage = { opened: 0, released: 0 };
+  withLedger.mockImplementation(async (fn) => {
+    usage.opened++;
+    try {
+      return await fn(session);
+    } finally {
+      usage.released++;
+    }
+  });
+  return usage;
 }
 
 function bufToBigInt(u8) {
@@ -364,7 +375,7 @@ describe('Ledger trade execute', () => {
   it('signs an EIP-1559 swap after screening and simulation, and the broadcast recovers to the wallet', async () => {
     const events = [];
     const session = fakeLedgerSession({ events });
-    useLedger(session);
+    const usage = useLedger(session);
     const { broadcasts } = mockEvmNetwork({ events });
     const quoteId = saveNativeEvmQuote({ maxFeePerGas: '6600000', maxPriorityFeePerGas: '1100000' });
 
@@ -385,6 +396,7 @@ describe('Ledger trade execute', () => {
       expect.any(Buffer),
     );
     expect(() => loadQuote(quoteId)).toThrow(/already executed/);
+    expect(usage).toEqual({ opened: 1, released: 1 });
   });
 
   it('signs a legacy (gasPrice-only) swap with an EIP-155 v', async () => {
@@ -405,7 +417,7 @@ describe('Ledger trade execute', () => {
 
   it('revokes, approves and swaps an ERC-20 inside one Ledger session', async () => {
     const session = fakeLedgerSession();
-    useLedger(session);
+    const usage = useLedger(session);
     // An allowance above the oversized threshold forces revoke → approve → swap.
     const { broadcasts } = mockEvmNetwork({ allowance: 10n ** 30n });
     const inputAmount = '100000';
@@ -441,6 +453,8 @@ describe('Ledger trade execute', () => {
     expect(approve.data.endsWith(BigInt(inputAmount).toString(16).padStart(64, '0'))).toBe(true);
     expect(swap.to).toBe(LIFI_ROUTER);
     expect(swap.data).toBe('0xdeadbeef');
+    // All three signatures share one session, released at the end.
+    expect(usage).toEqual({ opened: 1, released: 1 });
   });
 
   it('refuses before connecting when the Ledger wallet does not match the quote', async () => {
@@ -484,7 +498,7 @@ describe('Ledger trade execute', () => {
     session.signEvmTransaction.mockRejectedValue(
       new CommandError('Signing the transaction was rejected on the Ledger. Nothing was signed.', 'LEDGER_REJECTED'),
     );
-    useLedger(session);
+    const usage = useLedger(session);
     const { broadcasts } = mockEvmNetwork();
     const quoteId = saveNativeEvmQuote({ maxFeePerGas: '6600000' }, { quotes: 2 });
 
@@ -494,6 +508,8 @@ describe('Ledger trade execute', () => {
     expect(session.signEvmTransaction).toHaveBeenCalledTimes(1);
     expect(withLedger).toHaveBeenCalledTimes(1);
     expect(broadcasts).toHaveLength(0);
+    // The session opened for the rejected signature is still released.
+    expect(usage).toEqual({ opened: 1, released: 1 });
   });
 
   it('propagates a connection failure (no Ledger found) as-is', async () => {

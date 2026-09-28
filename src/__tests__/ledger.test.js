@@ -10,12 +10,14 @@ import { keccak256, signSecp256k1 } from '../crypto.js';
 const h = vi.hoisted(() => ({
   modules: null,
   usb: { unrefHotplugEvents: vi.fn() },
+  hid: { devicesAsync: async () => [] },
 }));
 
 vi.mock('node:module', async (importOriginal) => {
   const actual = await importOriginal();
   const fakeRequire = (name) => {
     if (name === 'usb') return { usb: h.usb };
+    if (name === 'node-hid') return h.hid;
     if (!h.modules || !h.modules[name]) {
       const err = new Error(`Cannot find module '${name}'`);
       err.code = 'MODULE_NOT_FOUND';
@@ -153,6 +155,18 @@ describe('withLedger: session lifecycle', () => {
     expectCleanedUp();
   });
 
+  it('reports an unplugged device as LEDGER_NOT_FOUND instead of the raw DMK tag', async () => {
+    dmk.startDiscovering.mockReturnValue({
+      subscribe({ error }) {
+        error({ _tag: 'NoAccessibleDeviceError' });
+        return { unsubscribe: vi.fn() };
+      },
+    });
+    const err = await withLedger(vi.fn()).catch((e) => e);
+    expect(err.code).toBe('LEDGER_NOT_FOUND');
+    expect(err.message).toMatch(/Plug it in over USB/);
+  });
+
   it('disconnects and closes the kit when the callback throws', async () => {
     const err = await withLedger(async () => { throw new Error('boom'); }).catch((e) => e);
     expect(err.message).toBe('boom');
@@ -223,6 +237,41 @@ describe('session.signEvmTransaction', () => {
   });
 });
 
+describe('session.signEvmTransaction after the blind-signing fallback', () => {
+  // The SDK reports the fallback step, then fails: what the user sees must
+  // depend on the status word, not on the step alone.
+  function failsAfterBlindFallback(error) {
+    return {
+      observable: observableOf(
+        { status: DeviceActionStatus.Pending, intermediateValue: { requiredUserInteraction: 'none', step: 'signer.eth.steps.blindSignTransactionFallback' } },
+        { status: DeviceActionStatus.Error, error },
+      ),
+      cancel: vi.fn(),
+    };
+  }
+  const sign = () => withLedger((s) => s.signEvmTransaction({ address: EVM_ADDRESS, path: LEDGER_PATHS.evm }, Buffer.from('02c0', 'hex')))
+    .catch((e) => e);
+
+  it('reports a rejection on the device as LEDGER_REJECTED, not as a settings problem', async () => {
+    eth.signTransaction.mockReturnValue(failsAfterBlindFallback({ _tag: 'EthAppCommandError', errorCode: '6985', message: 'Condition not satisfied' }));
+    expect((await sign()).code).toBe('LEDGER_REJECTED');
+  });
+
+  it('reports 6a80 as Blind signing being disabled', async () => {
+    eth.signTransaction.mockReturnValue(failsAfterBlindFallback({ _tag: 'EthAppCommandError', errorCode: '6a80', message: 'Invalid data' }));
+    const err = await sign();
+    expect(err.code).toBe('LEDGER_BLIND_SIGNING_DISABLED');
+    expect(err.message).toMatch(/Enable "Blind signing"/);
+  });
+
+  it('reports any other failure as a plain LEDGER_ERROR with its status word', async () => {
+    eth.signTransaction.mockReturnValue(failsAfterBlindFallback({ _tag: 'EthAppCommandError', errorCode: '6a84', message: 'Not enough space' }));
+    const err = await sign();
+    expect(err.code).toBe('LEDGER_ERROR');
+    expect(err.message).toMatch(/status 6a84/);
+  });
+});
+
 describe('session.signSolanaTransaction', () => {
   const tx = Buffer.concat([Buffer.from([1]), Buffer.alloc(64), Buffer.from('message')]);
 
@@ -257,5 +306,22 @@ describe('session.signSolanaTransaction', () => {
     const err = await withLedger((s) => s.signSolanaTransaction({ address: '11111111111111111111111111111111' }, tx)).catch((e) => e);
     expect(err.code).toBe('WALLET_MISMATCH');
     expect(solana.signTransaction).not.toHaveBeenCalled();
+  });
+});
+
+describe('Linux HID interface selection', () => {
+  it('keeps only the APDU interface so the transport never opens the FIDO one', async () => {
+    const flex = { vendorId: 0x2c97, productId: 0x7011 };
+    const listed = [
+      { ...flex, path: '/dev/hidraw4', interface: 0, usagePage: 0xffa0 },
+      { ...flex, path: '/dev/hidraw5', interface: 2, usagePage: 0xf1d0 },
+      { vendorId: 0x046d, productId: 0xc08b, path: '/dev/hidraw0', usagePage: 0x0001 },
+    ];
+    h.hid.devicesAsync = async () => listed;
+    // Any kit load goes through the filter; a missing kit still patches node-hid first.
+    await withLedger(async () => {}).catch(() => {});
+
+    const paths = (await h.hid.devicesAsync()).map((d) => d.path);
+    expect(paths).toEqual(['/dev/hidraw4', '/dev/hidraw0']);
   });
 });
